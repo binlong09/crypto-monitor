@@ -21,6 +21,7 @@ logs/
 # Environment variables
 .env
 .env.local
+streamlit_secrets_template.toml
 
 # Streamlit
 .streamlit/secrets.toml
