@@ -1,0 +1,1257 @@
+"""
+Crypto Portfolio Monitor Dashboard
+Interactive UI for crypto portfolio tracking with news sentiment analysis
+"""
+
+import sys
+from pathlib import Path
+project_root = Path(__file__).parent
+sys.path.insert(0, str(project_root))
+
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime, timedelta
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Import our modules
+from src.data.coingecko_client import CoinGeckoClient
+from src.data.news_fetcher import CryptoNewsFetcher
+from src.data.defi_tracker import DeFiTracker
+from src.monitoring.portfolio_tracker import CryptoPortfolioTracker
+from src.monitoring.alert_system import CryptoAlertSystem
+from src.llm.sentiment_analyzer import CryptoSentimentAnalyzer
+
+# Page configuration
+st.set_page_config(
+    page_title="Crypto Portfolio Monitor",
+    page_icon="₿",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #f7931a;
+        margin-bottom: 0.5rem;
+    }
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 5px solid #f7931a;
+    }
+    .success-metric {
+        border-left-color: #28a745;
+    }
+    .danger-metric {
+        border-left-color: #dc3545;
+    }
+    .bullish-sentiment {
+        color: #28a745;
+        font-weight: bold;
+    }
+    .bearish-sentiment {
+        color: #dc3545;
+        font-weight: bold;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize clients
+@st.cache_resource
+def get_clients():
+    return {
+        'coingecko': CoinGeckoClient(),
+        'news': CryptoNewsFetcher(),
+        'defi': DeFiTracker(),
+        'alerts': CryptoAlertSystem()
+    }
+
+clients = get_clients()
+
+# Sidebar navigation
+st.sidebar.title("₿ Navigation")
+page = st.sidebar.radio(
+    "Choose a view:",
+    ["🏠 Portfolio Overview", "📊 Market Data", "📰 News & Sentiment", "🔍 Analyze Individual Crypto", "💎 DeFi Positions", "🚨 Alerts", "⚙️ Settings"]
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 📌 Quick Stats")
+
+# Load portfolio stats for sidebar
+try:
+    tracker = CryptoPortfolioTracker()
+    summary = tracker.get_portfolio_summary()
+    if summary:
+        st.sidebar.metric("Portfolio Value", f"${summary['total_value']:,.2f}")
+        if summary.get('daily_change'):
+            daily = summary['daily_change']
+            st.sidebar.metric("24h Change", f"{daily['pct_change']:+.2f}%",
+                            delta=f"${daily['value_change']:+,.2f}")
+except Exception as e:
+    st.sidebar.info("Upload holdings to see stats")
+
+# ============================================================
+# PAGE 1: PORTFOLIO OVERVIEW
+# ============================================================
+if page == "🏠 Portfolio Overview":
+    st.markdown('<p class="main-header">Crypto Portfolio</p>', unsafe_allow_html=True)
+    st.markdown("**Track your Bitcoin and Ethereum holdings**")
+
+    st.markdown("---")
+
+    # File upload
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        uploaded_file = st.file_uploader("Upload your holdings CSV", type=['csv'])
+        st.caption("Expected format: symbol, amount, cost_basis, purchase_date")
+
+    with col2:
+        if st.button("Create Sample CSV"):
+            tracker = CryptoPortfolioTracker()
+            tracker.create_sample_csv("data/sample_holdings.csv")
+            st.success("Sample CSV created in data/sample_holdings.csv")
+
+    # Update portfolio button
+    if st.button("Update Portfolio", type="primary") or uploaded_file:
+        with st.spinner("Fetching latest prices..."):
+            tracker = CryptoPortfolioTracker()
+
+            if uploaded_file:
+                # Save uploaded file temporarily
+                temp_path = f"data/temp_{uploaded_file.name}"
+                with open(temp_path, 'wb') as f:
+                    f.write(uploaded_file.getbuffer())
+                portfolio_df = tracker.update_portfolio(temp_path)
+            else:
+                portfolio_df = tracker.update_portfolio()
+
+            if not portfolio_df.empty:
+                st.success("Portfolio updated!")
+
+                # Portfolio summary
+                summary = tracker.get_portfolio_summary()
+
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+                    st.metric("Total Value", f"${summary['total_value']:,.2f}")
+
+                with col2:
+                    if summary.get('daily_change'):
+                        daily = summary['daily_change']
+                        st.metric("24h Change", f"{daily['pct_change']:+.2f}%",
+                                delta=f"${daily['value_change']:+,.2f}")
+
+                with col3:
+                    if summary['total_cost_basis'] > 0:
+                        st.metric("Total P&L", f"${summary['total_pnl']:,.2f}",
+                                delta=f"{summary['total_pnl_pct']:+.2f}%")
+
+                with col4:
+                    st.metric("Holdings", summary['num_holdings'])
+
+                st.markdown("---")
+
+                # Holdings table
+                st.subheader("Current Holdings")
+
+                # Format for display
+                display_df = portfolio_df.copy()
+                display_df['current_price'] = display_df['current_price'].apply(lambda x: f"${x:,.2f}")
+                display_df['current_value'] = display_df['current_value'].apply(lambda x: f"${x:,.2f}")
+                display_df['profit_loss'] = display_df['profit_loss'].apply(lambda x: f"${x:,.2f}")
+                display_df['change_24h'] = display_df['change_24h'].apply(lambda x: f"{x:+.2f}%")
+                display_df['weight'] = display_df['weight'].apply(lambda x: f"{x:.1f}%")
+
+                st.dataframe(
+                    display_df[['symbol', 'amount', 'current_price', 'current_value',
+                              'weight', 'profit_loss', 'profit_loss_pct', 'change_24h']],
+                    use_container_width=True
+                )
+
+                # Portfolio allocation chart
+                st.subheader("Portfolio Allocation")
+                fig = px.pie(portfolio_df, values='current_value', names='symbol',
+                           title='Portfolio Distribution')
+                st.plotly_chart(fig, use_container_width=True)
+
+            else:
+                st.error("Failed to update portfolio")
+
+# ============================================================
+# PAGE 2: MARKET DATA
+# ============================================================
+elif page == "📊 Market Data":
+    st.markdown('<p class="main-header">Market Data</p>', unsafe_allow_html=True)
+
+    # Crypto selector
+    crypto = st.selectbox("Select Cryptocurrency", ['bitcoin', 'ethereum'])
+    symbol = 'BTC' if crypto == 'bitcoin' else 'ETH'
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Fetch Market Data", type="primary"):
+            with st.spinner(f"Fetching {symbol} data..."):
+                client = clients['coingecko']
+
+                # Current price
+                price_data = client.get_price(crypto)
+                if price_data:
+                    st.subheader(f"{symbol} Price")
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        st.metric("Current Price", f"${price_data['price']:,.2f}")
+                    with c2:
+                        st.metric("24h Change", f"{price_data['change_24h']:+.2f}%")
+                    with c3:
+                        st.metric("Market Cap", f"${price_data['market_cap']/1e9:.2f}B")
+                    with c4:
+                        st.metric("24h Volume", f"${price_data['volume_24h']/1e9:.2f}B")
+
+                # Market data
+                market_data = client.get_market_data(crypto)
+                if market_data:
+                    st.markdown("---")
+                    st.subheader("Detailed Market Data")
+
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.metric("24h High", f"${market_data['high_24h']:,.2f}")
+                        st.metric("7d Change", f"{market_data['price_change_percentage_7d']:+.2f}%")
+                        st.metric("ATH", f"${market_data['ath']:,.2f}")
+
+                    with c2:
+                        st.metric("24h Low", f"${market_data['low_24h']:,.2f}")
+                        st.metric("30d Change", f"{market_data['price_change_percentage_30d']:+.2f}%")
+                        st.metric("ATL", f"${market_data['atl']:,.2f}")
+
+                    with c3:
+                        st.metric("Circulating Supply", f"{market_data['circulating_supply']/1e6:.2f}M")
+                        if market_data['max_supply']:
+                            st.metric("Max Supply", f"{market_data['max_supply']/1e6:.2f}M")
+
+    with col2:
+        days = st.slider("Historical data (days)", 7, 365, 30)
+        if st.button("Fetch Historical Prices"):
+            with st.spinner("Fetching historical data..."):
+                client = clients['coingecko']
+                hist_df = client.get_historical_prices(crypto, days)
+
+                if not hist_df.empty:
+                    st.subheader(f"{symbol} Price History")
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=hist_df['timestamp'], y=hist_df['price'],
+                                           mode='lines', name='Price'))
+                    fig.update_layout(title=f'{symbol} Price - Last {days} Days',
+                                    xaxis_title='Date', yaxis_title='Price (USD)')
+                    st.plotly_chart(fig, use_container_width=True)
+
+    # Fear & Greed Index
+    st.markdown("---")
+    st.subheader("Crypto Fear & Greed Index")
+
+    if st.button("Fetch Fear & Greed Index"):
+        client = clients['coingecko']
+        fng = client.get_fear_greed_index()
+
+        if fng:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Index Value", fng['value'])
+            with col2:
+                st.metric("Classification", fng['classification'])
+            with col3:
+                st.write(f"Updated: {fng['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+
+            # Visual indicator
+            if fng['value'] < 25:
+                st.error("🔴 Extreme Fear - Potential buying opportunity")
+            elif fng['value'] < 45:
+                st.warning("🟠 Fear")
+            elif fng['value'] < 55:
+                st.info("🟡 Neutral")
+            elif fng['value'] < 75:
+                st.success("🟢 Greed")
+            else:
+                st.error("🔴 Extreme Greed - Potential selling opportunity")
+
+# ============================================================
+# PAGE 3: NEWS & SENTIMENT
+# ============================================================
+elif page == "📰 News & Sentiment":
+    st.markdown('<p class="main-header">News & Sentiment Analysis</p>', unsafe_allow_html=True)
+
+    crypto_symbol = st.selectbox("Select Cryptocurrency", ['BTC', 'ETH'])
+    hours_back = st.slider("Hours of news to fetch", 6, 48, 24)
+
+    if st.button("Fetch & Analyze News", type="primary"):
+        news_fetcher = clients['news']
+
+        with st.spinner("Fetching news articles..."):
+            articles = news_fetcher.get_crypto_news(crypto_symbol, hours_back)
+
+            if articles:
+                st.success(f"Found {len(articles)} articles for {crypto_symbol}")
+
+                # Sentiment analysis
+                if os.getenv('OPENAI_API_KEY'):
+                    with st.spinner("Analyzing sentiment with AI..."):
+                        try:
+                            analyzer = CryptoSentimentAnalyzer()
+                            analyzed = analyzer.analyze_news_batch(articles, crypto_symbol, max_articles=10)
+                            overall_sentiment = analyzer.get_overall_sentiment(analyzed)
+
+                            # Overall sentiment
+                            st.subheader("Overall Sentiment")
+                            col1, col2, col3, col4 = st.columns(4)
+
+                            with col1:
+                                sentiment_class = "bullish-sentiment" if overall_sentiment['avg_score'] > 0 else "bearish-sentiment"
+                                st.markdown(f"<p class='{sentiment_class}'>{overall_sentiment['sentiment_label']}</p>",
+                                          unsafe_allow_html=True)
+                                st.metric("Avg Score", f"{overall_sentiment['avg_score']:.1f}/10")
+
+                            with col2:
+                                st.metric("Bullish", overall_sentiment['bullish_count'],
+                                        delta="positive" if overall_sentiment['bullish_count'] > overall_sentiment['bearish_count'] else None)
+
+                            with col3:
+                                st.metric("Bearish", overall_sentiment['bearish_count'],
+                                        delta="negative" if overall_sentiment['bearish_count'] > overall_sentiment['bullish_count'] else None)
+
+                            with col4:
+                                st.metric("Critical News", overall_sentiment['critical_count'])
+
+                            # Sentiment distribution
+                            st.subheader("Sentiment Distribution")
+                            fig = go.Figure(data=[go.Bar(
+                                x=['Bullish', 'Neutral', 'Bearish'],
+                                y=[overall_sentiment['bullish_count'],
+                                   overall_sentiment['neutral_count'],
+                                   overall_sentiment['bearish_count']],
+                                marker_color=['green', 'gray', 'red']
+                            )])
+                            fig.update_layout(title='Article Sentiment Breakdown')
+                            st.plotly_chart(fig, use_container_width=True)
+
+                            # Display analyzed articles
+                            st.markdown("---")
+                            st.subheader("Recent Articles with Sentiment")
+
+                            for article in analyzed:
+                                sentiment = article['sentiment']
+
+                                with st.expander(f"{article['title']} - {sentiment['label']} ({sentiment['score']:+.1f})"):
+                                    st.write(f"**Source:** {article.get('source_name', 'Unknown')}")
+                                    st.write(f"**Published:** {article['published'].strftime('%Y-%m-%d %H:%M')}")
+                                    st.write(f"**Link:** {article['link']}")
+                                    st.write(f"**Sentiment:** {sentiment['explanation']}")
+
+                                    if sentiment['flags']['hack']:
+                                        st.error("⚠️ Security/Hack Alert")
+                                    if sentiment['flags']['regulation']:
+                                        st.warning("⚖️ Regulation News")
+                                    if sentiment['flags']['adoption']:
+                                        st.success("🚀 Adoption News")
+                                    if sentiment['flags']['tech']:
+                                        st.info("🔧 Technical Update")
+
+                        except Exception as e:
+                            st.error(f"Sentiment analysis failed: {e}")
+                            st.info("Showing news without sentiment analysis")
+
+                            for article in articles[:10]:
+                                with st.expander(article['title']):
+                                    st.write(f"**Source:** {article.get('source_name', 'Unknown')}")
+                                    st.write(f"**Published:** {article['published'].strftime('%Y-%m-%d %H:%M')}")
+                                    st.write(f"**Link:** {article['link']}")
+                                    st.write(article['summary'])
+                else:
+                    st.warning("Set OPENAI_API_KEY environment variable for sentiment analysis")
+                    st.info("Showing news without sentiment analysis")
+
+                    for article in articles[:10]:
+                        with st.expander(article['title']):
+                            st.write(f"**Source:** {article.get('source_name', 'Unknown')}")
+                            st.write(f"**Published:** {article['published'].strftime('%Y-%m-%d %H:%M')}")
+                            st.write(f"**Link:** {article['link']}")
+                            st.write(article['summary'])
+            else:
+                st.warning(f"No recent news found for {crypto_symbol}")
+
+# ============================================================
+# PAGE 4: ANALYZE INDIVIDUAL CRYPTO
+# ============================================================
+elif page == "🔍 Analyze Individual Crypto":
+    st.markdown('<p class="main-header">Analyze Individual Crypto</p>', unsafe_allow_html=True)
+    st.markdown("**Deep dive analysis with AI trading recommendations**")
+
+    st.markdown("---")
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        # Crypto selector
+        crypto_symbol = st.selectbox("Select Cryptocurrency to Analyze", ['BTC', 'ETH'], key='analyze_crypto')
+        crypto_id = 'bitcoin' if crypto_symbol == 'BTC' else 'ethereum'
+
+    with col2:
+        # Model selector
+        if os.getenv('OPENAI_API_KEY'):
+            from src.llm.sentiment_analyzer import CryptoSentimentAnalyzer
+            model_options = {
+                'gpt-4o-mini': 'GPT-4o Mini (Fast & Cheap)',
+                'gpt-4o': 'GPT-4o (Recommended)',
+                'gpt-4-turbo': 'GPT-4 Turbo (Most Capable)',
+                'o1-mini': 'O1 Mini (Reasoning)'
+            }
+            selected_model = st.selectbox(
+                "AI Model",
+                options=list(model_options.keys()),
+                format_func=lambda x: model_options[x],
+                index=1,  # Default to gpt-4o
+                key='model_select'
+            )
+
+            # Show cost estimate
+            costs = CryptoSentimentAnalyzer.MODELS[selected_model]
+            st.caption(f"Cost: ~${costs['input']}/M input, ~${costs['output']}/M output tokens")
+
+    # Initialize session state for showing analysis
+    if 'run_analysis' not in st.session_state:
+        st.session_state.run_analysis = False
+
+    if 'analysis_crypto' not in st.session_state:
+        st.session_state.analysis_crypto = None
+
+    # Track if we just ran a fresh analysis
+    if 'analysis_complete' not in st.session_state:
+        st.session_state.analysis_complete = False
+
+    # Button to trigger analysis
+    run_fresh_analysis = st.button("Run Complete Analysis", type="primary", key="analyze_btn")
+
+    if run_fresh_analysis:
+        st.session_state.run_analysis = True
+        st.session_state.analysis_crypto = crypto_symbol
+        st.session_state.analysis_complete = False  # Mark as needing fresh data
+
+    # Display analysis if triggered (persists across reruns)
+    if st.session_state.run_analysis and st.session_state.analysis_crypto == crypto_symbol:
+        client = clients['coingecko']
+        news_fetcher = clients['news']
+
+        # Only fetch data if this is a fresh analysis (not a rerun from Q&A)
+        if not st.session_state.analysis_complete:
+            with st.spinner(f"Analyzing {crypto_symbol}..."):
+                # Fetch all data once and cache it
+                market_data = client.get_market_data(crypto_id)
+
+                # Store in session state for reuse
+                st.session_state.cached_market_data = market_data
+        else:
+            # Use cached data
+            market_data = st.session_state.get('cached_market_data')
+
+        # Section 1: Current Price & Market Data
+        st.subheader(f"📈 {crypto_symbol} Market Overview")
+
+        if market_data:
+            if market_data:
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+                    st.metric("Current Price", f"${market_data['current_price']:,.2f}")
+                    st.metric("24h High", f"${market_data['high_24h']:,.2f}")
+
+                with col2:
+                    change_24h = market_data['price_change_percentage_24h']
+                    st.metric("24h Change", f"{change_24h:+.2f}%")
+                    st.metric("24h Low", f"${market_data['low_24h']:,.2f}")
+
+                with col3:
+                    st.metric("Market Cap", f"${market_data['market_cap']/1e9:.2f}B")
+                    st.metric("24h Volume", f"${market_data['total_volume']/1e9:.2f}B")
+
+                with col4:
+                    st.metric("7d Change", f"{market_data['price_change_percentage_7d']:+.2f}%")
+                    st.metric("30d Change", f"{market_data['price_change_percentage_30d']:+.2f}%")
+
+                # Supply metrics
+                st.markdown("---")
+                st.subheader("💰 Supply Metrics")
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Circulating Supply", f"{market_data['circulating_supply']/1e6:.2f}M {crypto_symbol}")
+                with col2:
+                    if market_data['total_supply']:
+                        st.metric("Total Supply", f"{market_data['total_supply']/1e6:.2f}M {crypto_symbol}")
+                with col3:
+                    if market_data['max_supply']:
+                        st.metric("Max Supply", f"{market_data['max_supply']/1e6:.2f}M {crypto_symbol}")
+                        supply_pct = (market_data['circulating_supply'] / market_data['max_supply'] * 100)
+                        st.caption(f"{supply_pct:.1f}% of max supply in circulation")
+
+                # ATH/ATL
+                st.markdown("---")
+                st.subheader("📊 All-Time Stats")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("All-Time High", f"${market_data['ath']:,.2f}")
+                    if market_data['ath_date']:
+                        ath_date = market_data['ath_date'][:10]
+                        st.caption(f"Reached on {ath_date}")
+
+                    # Distance from ATH
+                    distance_from_ath = ((market_data['current_price'] - market_data['ath']) / market_data['ath'] * 100)
+                    if distance_from_ath < -20:
+                        st.error(f"{distance_from_ath:.1f}% from ATH")
+                    else:
+                        st.warning(f"{distance_from_ath:.1f}% from ATH")
+
+                with col2:
+                    st.metric("All-Time Low", f"${market_data['atl']:,.2f}")
+                    if market_data['atl_date']:
+                        atl_date = market_data['atl_date'][:10]
+                        st.caption(f"Reached on {atl_date}")
+
+                    # Distance from ATL
+                    distance_from_atl = ((market_data['current_price'] - market_data['atl']) / market_data['atl'] * 100)
+                    st.success(f"+{distance_from_atl:.1f}% from ATL")
+
+            # Section 2: Historical Price Chart
+            st.markdown("---")
+            st.subheader("📉 Price History")
+
+            period = st.selectbox("Select Period", ['7 Days', '30 Days', '90 Days', '1 Year'], key='hist_period')
+            days_map = {'7 Days': 7, '30 Days': 30, '90 Days': 90, '1 Year': 365}
+            days = days_map[period]
+
+            # Fetch historical data only if fresh analysis
+            if not st.session_state.analysis_complete:
+                hist_df = client.get_historical_prices(crypto_id, days)
+                st.session_state.cached_hist_df = hist_df
+                st.session_state.cached_hist_days = days
+            else:
+                # Use cached data (or refetch if user changed the period)
+                if st.session_state.get('cached_hist_days') != days:
+                    hist_df = client.get_historical_prices(crypto_id, days)
+                    st.session_state.cached_hist_df = hist_df
+                    st.session_state.cached_hist_days = days
+                else:
+                    hist_df = st.session_state.get('cached_hist_df')
+
+            if not hist_df.empty:
+                # Create candlestick-style chart
+                fig = go.Figure()
+
+                # Price line
+                fig.add_trace(go.Scatter(
+                    x=hist_df['timestamp'],
+                    y=hist_df['price'],
+                    mode='lines',
+                    name='Price',
+                    line=dict(color='#f7931a', width=2)
+                ))
+
+                # Calculate percentage change
+                start_price = hist_df['price'].iloc[0]
+                end_price = hist_df['price'].iloc[-1]
+                pct_change = ((end_price - start_price) / start_price * 100)
+
+                fig.update_layout(
+                    title=f'{crypto_symbol} Price - Last {period} ({pct_change:+.2f}%)',
+                    xaxis_title='Date',
+                    yaxis_title='Price (USD)',
+                    hovermode='x unified',
+                    template='plotly_white'
+                )
+
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Price statistics
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Period High", f"${hist_df['price'].max():,.2f}")
+                with col2:
+                    st.metric("Period Low", f"${hist_df['price'].min():,.2f}")
+                with col3:
+                    st.metric("Average Price", f"${hist_df['price'].mean():,.2f}")
+                with col4:
+                    volatility = hist_df['price'].std()
+                    st.metric("Volatility (StdDev)", f"${volatility:,.2f}")
+
+            # Section 3: Recent News & Sentiment
+            st.markdown("---")
+            st.subheader("📰 Recent News & Sentiment Analysis")
+
+            # Fetch news only if fresh analysis
+            if not st.session_state.analysis_complete:
+                articles = news_fetcher.get_crypto_news(crypto_symbol, hours_back=48)
+                st.session_state.cached_articles = articles
+            else:
+                articles = st.session_state.get('cached_articles', [])
+
+            if articles:
+                st.write(f"Found {len(articles)} recent articles")
+
+                # Sentiment analysis if API key available
+                if os.getenv('OPENAI_API_KEY'):
+                    # Only run sentiment analysis if fresh analysis
+                    if not st.session_state.analysis_complete:
+                        with st.spinner("Analyzing sentiment..."):
+                            try:
+                                # Use selected model (or default if not set)
+                                model_to_use = selected_model if 'selected_model' in locals() else 'gpt-4o-mini'
+                                analyzer = CryptoSentimentAnalyzer(model=model_to_use)
+                                analyzed = analyzer.analyze_news_batch(articles, crypto_symbol, max_articles=10)
+                                overall = analyzer.get_overall_sentiment(analyzed)
+
+                                # Cache the sentiment results
+                                st.session_state.cached_analyzed = analyzed
+                                st.session_state.cached_overall = overall
+                            except Exception as e:
+                                st.error(f"Sentiment analysis failed: {e}")
+                                analyzed = []
+                                overall = None
+                    else:
+                        # Use cached sentiment analysis
+                        analyzed = st.session_state.get('cached_analyzed', [])
+                        overall = st.session_state.get('cached_overall')
+
+                    if analyzed and overall:
+                        # Overall sentiment display
+                        col1, col2, col3, col4 = st.columns(4)
+
+                        with col1:
+                            sentiment_class = "bullish-sentiment" if overall['avg_score'] > 0 else "bearish-sentiment"
+                            st.markdown(f"<p class='{sentiment_class}'>{overall['sentiment_label']}</p>",
+                                      unsafe_allow_html=True)
+                            st.metric("Sentiment Score", f"{overall['avg_score']:.1f}/10")
+
+                        with col2:
+                            st.metric("Bullish Articles", overall['bullish_count'])
+
+                        with col3:
+                            st.metric("Bearish Articles", overall['bearish_count'])
+
+                        with col4:
+                            if overall['critical_count'] > 0:
+                                st.metric("Critical News", overall['critical_count'])
+                                st.error("⚠️ Critical events detected")
+                            else:
+                                st.metric("Critical News", 0)
+
+                        # Top articles
+                        st.markdown("**Top Recent Articles:**")
+                        for i, article in enumerate(analyzed[:5], 1):
+                            sentiment = article['sentiment']
+                            sentiment_emoji = "🟢" if sentiment['score'] > 3 else "🔴" if sentiment['score'] < -3 else "⚪"
+
+                            with st.expander(f"{sentiment_emoji} {article['title']} ({sentiment['score']:+.1f})"):
+                                st.write(f"**Published:** {article['published'].strftime('%Y-%m-%d %H:%M')}")
+                                st.write(f"**Source:** {article.get('source_name', 'Unknown')}")
+                                st.write(f"**Sentiment:** {sentiment['label']} - {sentiment['explanation']}")
+                                st.write(f"**Link:** {article['link']}")
+
+                                # Flags
+                                if sentiment['flags']['hack']:
+                                    st.error("⚠️ Security/Hack Alert")
+                                if sentiment['flags']['regulation']:
+                                    st.warning("⚖️ Regulation News")
+                                if sentiment['flags']['adoption']:
+                                    st.success("🚀 Adoption News")
+                                if sentiment['flags']['tech']:
+                                    st.info("🔧 Technical Update")
+                else:
+                    st.info("Set OPENAI_API_KEY for sentiment analysis")
+                    for article in articles[:5]:
+                        with st.expander(article['title']):
+                            st.write(f"**Published:** {article['published'].strftime('%Y-%m-%d %H:%M')}")
+                            st.write(f"**Source:** {article.get('source_name', 'Unknown')}")
+                            st.write(f"**Link:** {article['link']}")
+            else:
+                st.warning("No recent news found")
+
+            # Section 4: On-Chain Metrics
+            st.markdown("---")
+            st.subheader("🔗 On-Chain & Social Metrics")
+
+            # Fetch on-chain data only if fresh analysis
+            if not st.session_state.analysis_complete:
+                on_chain = client.get_on_chain_metrics(crypto_id)
+                st.session_state.cached_on_chain = on_chain
+            else:
+                on_chain = st.session_state.get('cached_on_chain')
+
+            if on_chain:
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.write("**Social Metrics**")
+                    if on_chain['twitter_followers']:
+                        st.metric("Twitter Followers", f"{on_chain['twitter_followers']:,}")
+                    if on_chain['reddit_subscribers']:
+                        st.metric("Reddit Subscribers", f"{on_chain['reddit_subscribers']:,}")
+                    if on_chain['reddit_active_48h']:
+                        st.metric("Reddit Active (48h)", f"{on_chain['reddit_active_48h']:,}")
+
+                with col2:
+                    st.write("**Development Activity**")
+                    if on_chain['github_stars']:
+                        st.metric("GitHub Stars", f"{on_chain['github_stars']:,}")
+                    if on_chain['commit_count_4_weeks']:
+                        st.metric("Commits (4 weeks)", f"{on_chain['commit_count_4_weeks']:,}")
+                        if on_chain['commit_count_4_weeks'] > 500:
+                            st.success("🔥 High development activity")
+                    if on_chain['pull_requests_merged']:
+                        st.metric("PRs Merged", f"{on_chain['pull_requests_merged']:,}")
+
+            # Section 5: Risk Assessment Summary
+            st.markdown("---")
+            st.subheader("⚠️ Risk Assessment Summary")
+
+            risk_factors = []
+
+            # Volatility check
+            if hist_df is not None and not hist_df.empty:
+                volatility_pct = (hist_df['price'].std() / hist_df['price'].mean() * 100)
+                if volatility_pct > 15:
+                    risk_factors.append(f"High volatility: {volatility_pct:.1f}% standard deviation")
+
+            # Price decline check
+            if market_data:
+                if market_data['price_change_percentage_24h'] < -10:
+                    risk_factors.append(f"Significant 24h decline: {market_data['price_change_percentage_24h']:.1f}%")
+                if market_data['price_change_percentage_7d'] < -20:
+                    risk_factors.append(f"Sharp weekly decline: {market_data['price_change_percentage_7d']:.1f}%")
+
+            # Sentiment check
+            if os.getenv('OPENAI_API_KEY') and articles:
+                try:
+                    if overall['avg_score'] < -5:
+                        risk_factors.append(f"Very negative news sentiment: {overall['avg_score']:.1f}/10")
+                    if overall['critical_count'] > 0:
+                        risk_factors.append(f"{overall['critical_count']} critical news event(s) detected")
+                except:
+                    pass
+
+            if risk_factors:
+                st.warning("**Risk Factors Identified:**")
+                for factor in risk_factors:
+                    st.write(f"- {factor}")
+            else:
+                st.success("✅ No major risk factors detected")
+
+            # Section 6: AI Trading Recommendation
+            st.markdown("---")
+            st.subheader("🤖 AI Trading Recommendation")
+
+            if os.getenv('OPENAI_API_KEY') and market_data and articles:
+                # Only generate recommendation if fresh analysis
+                if not st.session_state.analysis_complete:
+                    with st.spinner("Generating trading recommendation..."):
+                        try:
+                            from src.llm.trading_advisor import TradingAdvisor
+
+                            # Use selected model for trading advice (default to gpt-4o for better reasoning)
+                            advisor_model = selected_model if 'selected_model' in locals() else 'gpt-4o'
+                            advisor = TradingAdvisor(model=advisor_model)
+
+                            # Prepare news summary
+                            news_summary = f"{len(articles)} articles analyzed"
+                            if 'overall' in locals() and overall:
+                                news_summary += f" - Overall sentiment: {overall['sentiment_label']} ({overall['avg_score']:.1f}/10)"
+
+                            # Get sentiment score
+                            sentiment_score = overall['avg_score'] if 'overall' in locals() and overall else 0
+
+                            # Get recommendation
+                            recommendation = advisor.get_trading_recommendation(
+                                symbol=crypto_symbol,
+                                current_price=market_data['current_price'],
+                                market_data=market_data,
+                                sentiment_score=sentiment_score,
+                                news_summary=news_summary,
+                                risk_factors=risk_factors
+                            )
+
+                            # Cache the recommendation and related data
+                            st.session_state.cached_recommendation = recommendation
+                            st.session_state.cached_advisor_model = advisor_model
+                            st.session_state.cached_sentiment_score = sentiment_score
+                            st.session_state.cached_news_summary = news_summary
+                            st.session_state.cached_risk_factors = risk_factors
+                        except Exception as e:
+                            st.error(f"Error generating trading recommendation: {e}")
+                            recommendation = None
+                else:
+                    # Use cached recommendation
+                    recommendation = st.session_state.get('cached_recommendation')
+                    advisor_model = st.session_state.get('cached_advisor_model', 'gpt-4o')
+                    sentiment_score = st.session_state.get('cached_sentiment_score', 0)
+                    news_summary = st.session_state.get('cached_news_summary', '')
+                    risk_factors = st.session_state.get('cached_risk_factors', [])
+
+                if recommendation:
+                    # Create advisor instance for risk/reward calculation
+                    from src.llm.trading_advisor import TradingAdvisor
+                    advisor = TradingAdvisor(model=advisor_model)
+
+                    # Display recommendation
+                    rec_type = recommendation.get('recommendation', 'HOLD')
+
+                        # Color-coded recommendation
+                        if rec_type == 'BUY':
+                            st.success(f"### 🟢 RECOMMENDATION: {rec_type}")
+                        elif rec_type == 'SELL':
+                            st.error(f"### 🔴 RECOMMENDATION: {rec_type}")
+                        else:
+                            st.info(f"### 🟡 RECOMMENDATION: {rec_type}")
+
+                        # Confidence meter
+                        confidence = recommendation.get('confidence', 0)
+                        st.progress(confidence / 100)
+                        st.write(f"**Confidence Level:** {confidence}%")
+
+                        # Main metrics in columns
+                        col1, col2, col3, col4 = st.columns(4)
+
+                        with col1:
+                            entry = recommendation.get('entry_price', market_data['current_price'])
+                            st.metric("Entry Price", f"${entry:,.2f}")
+
+                        with col2:
+                            stop_loss_price = recommendation.get('stop_loss_price', entry * 0.90)
+                            stop_loss_pct = recommendation.get('stop_loss_pct', 10.0)
+                            st.metric("Stop Loss", f"${stop_loss_price:,.2f}", f"-{stop_loss_pct:.1f}%")
+
+                        with col3:
+                            tp1 = recommendation.get('take_profit_1', entry * 1.10)
+                            st.metric("Take Profit 1", f"${tp1:,.2f}")
+
+                        with col4:
+                            position_size = recommendation.get('position_size', 5.0)
+                            st.metric("Position Size", f"{position_size:.1f}%")
+
+                        # Reasoning
+                        st.markdown("**Reasoning:**")
+                        st.write(recommendation.get('reasoning', 'No reasoning provided'))
+
+                        # Additional details in expander
+                        with st.expander("📋 View Detailed Trading Plan"):
+                            st.markdown("**Entry Strategy:**")
+                            if rec_type == 'BUY':
+                                st.write(f"- Enter at current market price: ${entry:,.2f}")
+                                st.write(f"- Or wait for dip to: ${entry * 0.98:,.2f} (2% lower)")
+                            else:
+                                st.write("- N/A (Not a buy recommendation)")
+
+                            st.markdown("**Exit Strategy:**")
+                            st.write(f"- Stop Loss: ${stop_loss_price:,.2f} ({stop_loss_pct:.1f}% risk)")
+                            if 'take_profit_1' in recommendation:
+                                st.write(f"- Take Profit 1 (50%): ${recommendation['take_profit_1']:,.2f}")
+                            if 'take_profit_2' in recommendation:
+                                st.write(f"- Take Profit 2 (50%): ${recommendation['take_profit_2']:,.2f}")
+
+                            st.markdown("**Risk/Reward Analysis:**")
+                            if rec_type == 'BUY' and 'take_profit_1' in recommendation:
+                                rr = advisor.get_risk_reward_analysis(
+                                    entry,
+                                    stop_loss_price,
+                                    recommendation['take_profit_1']
+                                )
+                                st.write(f"- Risk: ${rr['risk_amount']:,.2f} ({rr['risk_pct']:.1f}%)")
+                                st.write(f"- Reward: ${rr['reward_amount']:,.2f} ({rr['reward_pct']:.1f}%)")
+                                st.write(f"- Risk/Reward Ratio: 1:{rr['risk_reward_ratio']:.2f}")
+                                if rr['is_favorable']:
+                                    st.success("✅ Favorable risk/reward ratio (>2:1)")
+                                else:
+                                    st.warning("⚠️ Risk/reward ratio below 2:1")
+
+                            st.markdown("**Position Sizing:**")
+                            st.write(f"- Recommended allocation: {position_size:.1f}% of portfolio")
+                            portfolio_value = st.number_input("Your portfolio value ($)", value=10000, step=1000)
+                            position_value = portfolio_value * (position_size / 100)
+                            st.write(f"- Position size: ${position_value:,.2f}")
+                            if entry > 0:
+                                units = position_value / entry
+                                st.write(f"- Units to buy: {units:.4f} {crypto_symbol}")
+
+                            st.markdown("**Time Horizon:**")
+                            st.write(f"- {recommendation.get('time_horizon', 'Not specified')}")
+
+                            st.markdown("**Key Risks to Monitor:**")
+                            key_risks = recommendation.get('key_risks', [])
+                            for risk in key_risks:
+                                st.write(f"- {risk}")
+
+                            st.markdown("**Invalidation Criteria:**")
+                            st.write(recommendation.get('invalidation', 'Not specified'))
+                            st.caption("If this condition occurs, exit the position immediately.")
+
+                        # Important disclaimer
+                        st.error("""
+                        ⚠️ **IMPORTANT DISCLAIMER**
+
+                        This is AI-generated advice for informational and educational purposes only.
+                        - NOT financial advice
+                        - Past performance does not guarantee future results
+                        - Cryptocurrency is highly volatile and risky
+                        - Only invest what you can afford to lose
+                        - Always do your own research (DYOR)
+                        - Consult a licensed financial advisor before investing
+
+                        The AI model may make mistakes or provide incorrect analysis.
+                        """)
+
+                        # Mark analysis as complete (prevents re-fetching on Q&A reruns)
+                        st.session_state.analysis_complete = True
+
+                        # Interactive Q&A Section
+                        st.markdown("---")
+                        st.subheader("💬 Ask Follow-up Questions")
+                        st.caption("Ask the AI to explain or clarify any aspect of the recommendation")
+
+                        # Create unique key for this analysis
+                        analysis_key = f"{crypto_symbol}_{market_data['current_price']:.0f}"
+
+                        # Initialize conversation history in session state
+                        if 'conversation_history' not in st.session_state:
+                            st.session_state.conversation_history = {}
+
+                        if 'current_analysis_key' not in st.session_state:
+                            st.session_state.current_analysis_key = None
+
+                        # Check if this is a new analysis
+                        if st.session_state.current_analysis_key != analysis_key:
+                            st.session_state.current_analysis_key = analysis_key
+                            st.session_state.conversation_history[analysis_key] = []
+
+                            # Store the recommendation context
+                            st.session_state.recommendation_context = {
+                                'symbol': crypto_symbol,
+                                'recommendation': recommendation,
+                                'market_data': market_data,
+                                'sentiment_score': sentiment_score,
+                                'news_summary': news_summary,
+                                'risk_factors': risk_factors,
+                                'model': advisor_model
+                            }
+
+                        # Get current conversation history
+                        current_history = st.session_state.conversation_history.get(analysis_key, [])
+
+                        # Display conversation history
+                        if current_history:
+                            st.markdown("**Previous Q&A:**")
+                            for qa in current_history:
+                                with st.chat_message("user"):
+                                    st.write(qa['question'])
+                                with st.chat_message("assistant"):
+                                    st.write(qa['answer'])
+
+                        # Question input form to prevent rerun on button click
+                        with st.form(key="qa_form", clear_on_submit=True):
+                            user_question = st.text_area(
+                                "Your question:",
+                                placeholder="e.g., Why is the stop loss at this level? What if the price drops 20%? Should I buy now or wait?",
+                                height=80,
+                                key="question_input"
+                            )
+
+                            col1, col2 = st.columns([1, 5])
+                            with col1:
+                                ask_button = st.form_submit_button("Ask AI", type="primary")
+                            with col2:
+                                clear_button = st.form_submit_button("Clear History")
+
+                        # Handle clear history
+                        if clear_button:
+                            st.session_state.conversation_history[analysis_key] = []
+                            st.success("Conversation history cleared!")
+
+                        # Handle question submission
+                        if ask_button and user_question:
+                            with st.spinner("Thinking..."):
+                                try:
+                                    # Build context for the question
+                                    context = st.session_state.recommendation_context
+                                    rec = context['recommendation']
+
+                                    # Build conversation context
+                                    conversation_context = f"""You are a cryptocurrency trading advisor. You previously provided this trading recommendation:
+
+CRYPTOCURRENCY: {context['symbol']}
+CURRENT PRICE: ${context['market_data']['current_price']:,.2f}
+
+YOUR RECOMMENDATION: {rec.get('recommendation', 'N/A')}
+CONFIDENCE: {rec.get('confidence', 0)}%
+REASONING: {rec.get('reasoning', 'N/A')}
+
+ENTRY PRICE: ${rec.get('entry_price', 0):,.2f}
+STOP LOSS: {rec.get('stop_loss_pct', 0):.1f}% (${rec.get('stop_loss_price', 0):,.2f})
+TAKE PROFIT 1: ${rec.get('take_profit_1', 0):,.2f}
+TAKE PROFIT 2: ${rec.get('take_profit_2', 0):,.2f}
+POSITION SIZE: {rec.get('position_size', 0):.1f}%
+TIME HORIZON: {rec.get('time_horizon', 'N/A')}
+
+MARKET CONDITIONS:
+- 24h Change: {context['market_data'].get('price_change_percentage_24h', 0):.2f}%
+- 7d Change: {context['market_data'].get('price_change_percentage_7d', 0):.2f}%
+- 30d Change: {context['market_data'].get('price_change_percentage_30d', 0):.2f}%
+- News Sentiment: {context['sentiment_score']:.1f}/10
+
+RISK FACTORS: {', '.join(context['risk_factors']) if context['risk_factors'] else 'None identified'}
+"""
+
+                                    # Add previous Q&A to context
+                                    if current_history:
+                                        conversation_context += "\n\nPREVIOUS QUESTIONS AND ANSWERS:\n"
+                                        for qa in current_history[-3:]:  # Last 3 Q&As
+                                            conversation_context += f"\nQ: {qa['question']}\nA: {qa['answer']}\n"
+
+                                    conversation_context += f"\n\nNEW QUESTION: {user_question}\n\nProvide a clear, concise answer. If the question is about risk management, be conservative. If it's about entry timing, consider both immediate and patient approaches."
+
+                                    # Get answer from LLM
+                                    response = advisor.client.chat.completions.create(
+                                        model=context['model'],
+                                        messages=[
+                                            {
+                                                "role": "system",
+                                                "content": "You are a helpful cryptocurrency trading advisor. Answer questions about your previous recommendation clearly and concisely. Be honest about uncertainties and always emphasize risk management."
+                                            },
+                                            {
+                                                "role": "user",
+                                                "content": conversation_context
+                                            }
+                                        ],
+                                        temperature=0.5,
+                                        max_tokens=500
+                                    )
+
+                                    answer = response.choices[0].message.content.strip()
+
+                                    # Store in conversation history with correct key
+                                    if analysis_key not in st.session_state.conversation_history:
+                                        st.session_state.conversation_history[analysis_key] = []
+
+                                    st.session_state.conversation_history[analysis_key].append({
+                                        'question': user_question,
+                                        'answer': answer
+                                    })
+
+                                    # Display the new Q&A immediately
+                                    with st.chat_message("user"):
+                                        st.write(user_question)
+                                    with st.chat_message("assistant"):
+                                        st.write(answer)
+
+                                except Exception as e:
+                                    st.error(f"Error getting answer: {e}")
+
+                    except Exception as e:
+                        st.error(f"Error generating trading recommendation: {e}")
+            else:
+                if not os.getenv('OPENAI_API_KEY'):
+                    st.warning("Set OPENAI_API_KEY to get AI trading recommendations")
+                else:
+                    st.warning("Complete the analysis above to get trading recommendations")
+
+            # Investment considerations
+            st.markdown("---")
+            st.info(f"""
+            **Key Takeaways for {crypto_symbol}:**
+
+            - Current price is {distance_from_ath:.1f}% from all-time high
+            - {pct_change:+.1f}% price change over the last {period.lower()}
+            - {len(articles)} recent news articles covering this crypto
+            - Market cap: ${market_data['market_cap']/1e9:.2f}B
+
+            *This is for informational purposes only. Always do your own research (DYOR) before investing.*
+            """)
+
+# ============================================================
+# PAGE 5: DEFI POSITIONS
+# ============================================================
+elif page == "💎 DeFi Positions":
+    st.markdown('<p class="main-header">DeFi Positions</p>', unsafe_allow_html=True)
+    st.markdown("**Track staking, liquidity pools, and yield farming**")
+
+    tab1, tab2 = st.tabs(["📊 DeFi Protocols", "💰 My Positions"])
+
+    with tab1:
+        if st.button("Fetch DeFi Protocol TVLs"):
+            with st.spinner("Fetching DeFi data..."):
+                defi = clients['defi']
+                protocols_df = defi.get_defi_protocols_tvl()
+
+                if not protocols_df.empty:
+                    st.subheader("Top DeFi Protocols by TVL")
+
+                    # Format for display
+                    display_df = protocols_df.copy()
+                    display_df['tvl'] = display_df['tvl'].apply(lambda x: f"${x/1e9:.2f}B")
+                    display_df['change_1d'] = display_df['change_1d'].apply(lambda x: f"{x:+.2f}%")
+                    display_df['change_7d'] = display_df['change_7d'].apply(lambda x: f"{x:+.2f}%")
+
+                    st.dataframe(display_df, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("Current Staking Yields")
+        yields_df = clients['defi'].get_staking_yields()
+        st.dataframe(yields_df, use_container_width=True)
+
+    with tab2:
+        st.info("Upload a CSV with your DeFi positions to track yields")
+
+        if st.button("Create DeFi Positions Template"):
+            defi = clients['defi']
+            defi.create_sample_defi_csv("data/defi_positions_template.csv")
+            st.success("Template created at data/defi_positions_template.csv")
+
+        uploaded_file = st.file_uploader("Upload DeFi positions CSV", type=['csv'])
+
+        if uploaded_file:
+            defi = clients['defi']
+            temp_path = f"data/temp_{uploaded_file.name}"
+            with open(temp_path, 'wb') as f:
+                f.write(uploaded_file.getbuffer())
+
+            positions_df = defi.parse_defi_positions_csv(temp_path)
+
+            if not positions_df.empty:
+                st.subheader("Your DeFi Positions")
+
+                # Summary
+                total_principal = positions_df['amount'].sum()
+                total_yield = positions_df['accrued_yield'].sum()
+                total_value = positions_df['current_value'].sum()
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total Principal", f"${total_principal:,.2f}")
+                with col2:
+                    st.metric("Accrued Yield", f"${total_yield:,.2f}")
+                with col3:
+                    st.metric("Current Value", f"${total_value:,.2f}")
+
+                st.dataframe(positions_df, use_container_width=True)
+
+# ============================================================
+# PAGE 6: ALERTS
+# ============================================================
+elif page == "🚨 Alerts":
+    st.markdown('<p class="main-header">Portfolio Alerts</p>', unsafe_allow_html=True)
+
+    if st.button("Generate Alerts", type="primary"):
+        with st.spinner("Checking for alerts..."):
+            alert_system = clients['alerts']
+            all_alerts = []
+
+            try:
+                # Portfolio alerts
+                tracker = CryptoPortfolioTracker()
+                portfolio_df = tracker.update_portfolio()
+                summary = tracker.get_portfolio_summary()
+
+                if not portfolio_df.empty:
+                    thresholds = alert_system.get_default_thresholds()
+
+                    # Price alerts
+                    price_alerts = alert_system.check_price_alerts(portfolio_df, thresholds)
+                    all_alerts.extend(price_alerts)
+
+                    # Portfolio alerts
+                    portfolio_alerts = alert_system.check_portfolio_alerts(summary, thresholds)
+                    all_alerts.extend(portfolio_alerts)
+
+                if all_alerts:
+                    st.warning(f"Found {len(all_alerts)} alert(s)")
+
+                    # Display alerts by severity
+                    for severity in ['HIGH', 'MEDIUM', 'LOW']:
+                        severity_alerts = [a for a in all_alerts if a['severity'] == severity]
+                        if severity_alerts:
+                            if severity == 'HIGH':
+                                st.error(f"**{severity} PRIORITY**")
+                            elif severity == 'MEDIUM':
+                                st.warning(f"**{severity} PRIORITY**")
+                            else:
+                                st.info(f"**{severity} PRIORITY**")
+
+                            for alert in severity_alerts:
+                                st.write(f"- {alert['message']}")
+                            st.markdown("---")
+                else:
+                    st.success("No alerts at this time!")
+
+            except Exception as e:
+                st.error(f"Error generating alerts: {e}")
+
+# ============================================================
+# PAGE 7: SETTINGS
+# ============================================================
+elif page == "⚙️ Settings":
+    st.markdown('<p class="main-header">Settings</p>', unsafe_allow_html=True)
+
+    st.subheader("API Configuration")
+
+    openai_key = os.getenv('OPENAI_API_KEY', '')
+    st.text_input("OpenAI API Key", value="*" * 20 if openai_key else "",
+                 disabled=True, help="Set via OPENAI_API_KEY environment variable")
+
+    if openai_key:
+        st.success("OpenAI API key configured")
+    else:
+        st.warning("OpenAI API key not set - sentiment analysis will be disabled")
+
+    st.markdown("---")
+    st.subheader("Alert Thresholds")
+
+    alert_system = clients['alerts']
+    default_thresholds = alert_system.get_default_thresholds()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.write("**Bitcoin (BTC)**")
+        btc_drop = st.slider("Price drop alert (%)", 5, 20, default_thresholds['BTC']['drop_pct'])
+        btc_spike = st.slider("Price spike alert (%)", 5, 30, default_thresholds['BTC']['spike_pct'])
+
+    with col2:
+        st.write("**Ethereum (ETH)**")
+        eth_drop = st.slider("Price drop alert (%)", 5, 25, default_thresholds['ETH']['drop_pct'])
+        eth_spike = st.slider("Price spike alert (%)", 5, 35, default_thresholds['ETH']['spike_pct'])
+
+    st.markdown("---")
+    st.subheader("About")
+    st.info("""
+    **Crypto Portfolio Monitor**
+
+    Track Bitcoin and Ethereum holdings with:
+    - Real-time price data from CoinGecko
+    - AI-powered news sentiment analysis
+    - DeFi position tracking
+    - Automated alerts
+    - Fear & Greed Index
+
+    Built with Streamlit, OpenAI GPT-4, and CoinGecko API
+    """)
